@@ -1126,7 +1126,13 @@ async fn status_snapshot_includes_enterprise_monthly_credit_limit() {
         plan_type: None,
         rate_limit_reached_type: None,
     };
-    let rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
+    let mut rate_display = rate_limit_snapshot_display(&snapshot, captured_at);
+    let individual_limit = rate_display
+        .individual_limit
+        .as_mut()
+        .expect("monthly limit");
+    individual_limit.used = "8,000".to_string();
+    individual_limit.limit = "25,000".to_string();
 
     let model_slug = get_model_offline_for_tests(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);

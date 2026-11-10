@@ -80,7 +80,11 @@ fn status_style_for(
 const TABLE_SEPARATOR_FG_ALPHA: f32 = 0.20;
 
 pub fn user_message_style() -> Style {
-    user_message_style_for(default_bg())
+    let style = user_message_style_for(default_bg());
+    match default_fg() {
+        Some(foreground) => style.fg(best_color(foreground)),
+        None => style,
+    }
 }
 
 /// Submitted prompts use a lighter fill than the editable composer in either theme.

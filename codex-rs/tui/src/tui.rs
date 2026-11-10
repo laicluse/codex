@@ -75,6 +75,7 @@ mod notification_preview;
 #[cfg(test)]
 #[path = "tui/owned_screen_tests.rs"]
 mod owned_screen_tests;
+mod palette_refresh;
 #[cfg(all(test, unix))]
 #[path = "tui_panic_tests.rs"]
 mod panic_tests;
@@ -144,9 +145,27 @@ mod tests {
     use crate::custom_terminal::Terminal as CustomTerminal;
     use crate::test_backend::VT100Backend;
     use codex_config::types::NotificationCondition;
+    use crossterm::Command;
     use ratatui::layout::Position;
     use ratatui::layout::Rect;
     use ratatui::text::Line;
+
+    #[test]
+    fn color_scheme_reporting_commands_emit_dec_mode_2031() {
+        let mut enable = String::new();
+        super::EnableColorSchemeChange
+            .write_ansi(&mut enable)
+            .expect("write enable sequence");
+        let mut disable = String::new();
+        super::DisableColorSchemeChange
+            .write_ansi(&mut disable)
+            .expect("write disable sequence");
+
+        assert_eq!(
+            (enable, disable),
+            ("\x1b[?2031h".into(), "\x1b[?2031l".into())
+        );
+    }
 
     #[test]
     fn unfocused_notification_condition_is_suppressed_when_focused() {
@@ -268,7 +287,55 @@ pub fn set_modes() -> Result<()> {
     let _ = execute!(stdout(), EnableFocusChange);
     #[cfg(windows)]
     let _ = execute!(stdout(), DisableFocusChange);
+    #[cfg(unix)]
+    let _ = execute!(stdout(), EnableColorSchemeChange);
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(unix, test))]
+struct EnableColorSchemeChange;
+
+#[cfg(any(unix, test))]
+impl Command for EnableColorSchemeChange {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str("\x1b[?2031h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> Result<()> {
+        Err(std::io::Error::other(
+            "tried to enable color scheme reporting using WinAPI; use ANSI instead",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(unix, test))]
+struct DisableColorSchemeChange;
+
+#[cfg(any(unix, test))]
+impl Command for DisableColorSchemeChange {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str("\x1b[?2031l")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> Result<()> {
+        Err(std::io::Error::other(
+            "tried to disable color scheme reporting using WinAPI; use ANSI instead",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +423,8 @@ fn restore_common(
     if let Err(err) = execute!(stdout(), DisableBracketedPaste) {
         first_error.get_or_insert(err);
     }
+    #[cfg(unix)]
+    let _ = execute!(stdout(), DisableColorSchemeChange);
     let _ = execute!(stdout(), DisableFocusChange);
     if raw_mode_restore == RawModeRestore::DrainAndDisable {
         #[cfg(unix)]
@@ -920,6 +989,29 @@ impl Tui {
         probe_windows_default_colors();
         self.resume_events();
         self.frame_requester.schedule_frame();
+    }
+
+    pub(crate) fn take_terminal_palette_refresh_request(&self) -> bool {
+        self.event_broker.take_terminal_palette_refresh_request()
+    }
+
+    pub(crate) fn request_terminal_palette(&mut self) -> io::Result<()> {
+        if !self.event_broker.begin_terminal_palette_refresh() {
+            return Ok(());
+        }
+        let mut output = stdout();
+        output.write_all(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[c")?;
+        output.flush()
+    }
+
+    pub(crate) fn apply_terminal_palette_update(&mut self) -> bool {
+        if let Some(colors) = self.event_broker.take_terminal_palette_update() {
+            crate::terminal_palette::set_default_colors_from_startup_probe(Some(colors));
+            self.terminal.invalidate_viewport();
+            self.frame_requester.schedule_frame();
+            return true;
+        }
+        false
     }
 
     /// Reclaim terminal modes and stderr after a panic hook ran inside a recovery boundary.

@@ -1,0 +1,13 @@
+# Terminal theme refresh
+
+The `terminal-theme-refresh` branch starts from OpenAI's `rust-v0.167.0` release. It refreshes the running TUI's terminal palette when a supporting terminal changes its colors, preserving the current conversation and composer draft.
+
+The TUI subscribes to DEC private mode 2031 on Unix. A color-scheme notification requests OSC 10/11 replies through the existing Crossterm event stream, followed by a DA1 response fence. Foreground and background are applied together after that fence, then palette-dependent rendering is refreshed. Notifications during an outstanding query coalesce into a subsequent query. No competing terminal reader, blocking runtime probe, or overlapping query is used. Terminals without scheme notifications retain the upstream behavior; incomplete color replies leave the previous palette intact. The terminal must answer DA1 after preceding color replies; if it never answers the fence, further palette refreshes remain pending without blocking input.
+
+The dependency is pinned to the terminal-color event changes in [laicluse/crossterm](https://github.com/laicluse/crossterm/tree/terminal-color-scheme), based on the same Crossterm revision as the upstream release. The starting implementations are [Piotr's Codex patch](https://github.com/piotrostr/codex/pull/1) and [Crossterm patch](https://github.com/openai-oss-forks/crossterm/pull/3); runtime palette collection was adapted to use a single asynchronous input reader.
+
+Relevant upstream reports: [stale palette cache](https://github.com/openai/codex/issues/45163) and [color-scheme notifications](https://github.com/openai/codex/issues/38575).
+
+To validate this branch, first build `codex-cli` from `codex-rs` with `cargo build -p codex-cli`, then run `just test -p codex-tui --test-threads 1` from the repository root. Some existing integration tests require the full CLI executable. Use an isolated Git configuration for test fixtures if the host installs global hooks. The PTY regression exercises both theme directions in one process, checks composer foreground/background colors, and preserves interleaved pasted input. Snapshots and the Cargo lockfile reflect the release manifest's `0.167.0` version rather than the upstream development version.
+
+For an upstream version update, rebase this branch onto the selected release, update the pinned dependency while retaining its terminal-color events, and rerun the TUI regression suite before distributing a replacement binary. Once upstream includes equivalent behavior, retire these patches. This fork does not change an installed CLI automatically.

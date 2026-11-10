@@ -274,6 +274,7 @@ mod startup;
 pub(crate) mod startup_bootstrap;
 mod startup_prompts;
 mod startup_warnings;
+mod terminal_palette_refresh;
 mod thread_event_buffer;
 mod thread_events;
 mod thread_goal_actions;
@@ -869,6 +870,7 @@ impl App {
         app_server: &mut AppServerSession,
         event: TuiEvent,
     ) -> Result<AppRunControl> {
+        self.refresh_terminal_palette(tui);
         self.transcript_view
             .sync_patch_approval(self.chat_widget.current_patch_approval());
         tui.link_hover.observe(&event);

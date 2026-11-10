@@ -21,6 +21,7 @@ use tempfile::TempDir;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
 const FOCUS_INPUT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 5);
 const FOCUS_PROBE_INPUT: &str = "focus-palette-24527";
+const REFRESH_PROBE_INPUT: &str = "refresh-palette-24527";
 
 #[path = "external_editor_tests.rs"]
 mod external_editor;
@@ -294,6 +295,79 @@ fn fullscreen_transcript_can_opt_out_to_terminal_scrollback() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn color_scheme_event_requeries_palette_and_preserves_typeahead() -> Result<()> {
+    let repo_root = codex_utils_cargo_bin::repo_root()?;
+    let codex_home = tempfile::tempdir()?;
+    write_test_config(codex_home.path(), &repo_root)?;
+
+    let mut terminal = PtyCodex::start(&repo_root, codex_home, &["--no-alt-screen"])?;
+    terminal.wait_for_startup()?;
+    terminal.wait_for_screen_text("GPT-5.6-Terra", STARTUP_TIMEOUT)?;
+    ensure!(
+        contains_bytes(&terminal.output, b"\x1b[?2031h"),
+        "Codex did not enable DEC mode 2031",
+    );
+
+    let refresh_output_start = terminal.output.len();
+    terminal.write_input(b"\x1b[?997;2n")?;
+    terminal.answer_refresh_query_with_typeahead(
+        refresh_output_start,
+        ("0000/0000/0000", "ffff/ffff/ffff"),
+    )?;
+    terminal.wait_for_screen_text(REFRESH_PROBE_INPUT, FOCUS_INPUT_TIMEOUT)?;
+    terminal
+        .wait_for_composer_colors(vt100::Color::Rgb(0, 0, 0), vt100::Color::Rgb(244, 244, 244))?;
+
+    let refresh_output_start = terminal.output.len();
+    terminal.write_input(b"\x1b[?997;1n")?;
+    terminal.answer_refresh_query_with_typeahead(
+        refresh_output_start,
+        ("ffff/ffff/ffff", "0000/0000/0000"),
+    )?;
+    terminal.wait_for_screen_text(
+        &format!("{REFRESH_PROBE_INPUT}{REFRESH_PROBE_INPUT}"),
+        FOCUS_INPUT_TIMEOUT,
+    )?;
+    terminal.wait_for_composer_colors(
+        vt100::Color::Rgb(255, 255, 255),
+        vt100::Color::Rgb(30, 30, 30),
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn an_unanswered_palette_query_preserves_input_and_recovers_after_its_fence() -> Result<()> {
+    let repo_root = codex_utils_cargo_bin::repo_root()?;
+    let codex_home = tempfile::tempdir()?;
+    write_test_config(codex_home.path(), &repo_root)?;
+    let mut terminal = PtyCodex::start(&repo_root, codex_home, &["--no-alt-screen"])?;
+    terminal.wait_for_startup()?;
+    terminal.wait_for_screen_text("GPT-5.6-Terra", STARTUP_TIMEOUT)?;
+    terminal.write_input(format!("\x1b[?997;2n{REFRESH_PROBE_INPUT}").as_bytes())?;
+    terminal.wait_for_screen_text(REFRESH_PROBE_INPUT, FOCUS_INPUT_TIMEOUT)?;
+    terminal.write_input(b"\x1b[?1;2c")?;
+    terminal.wait_for_composer_colors(
+        vt100::Color::Rgb(255, 255, 255),
+        vt100::Color::Rgb(30, 30, 30),
+    )?;
+
+    let refresh_output_start = terminal.output.len();
+    terminal.write_input(b"\x1b[?997;2n")?;
+    terminal.answer_refresh_query_with_typeahead(
+        refresh_output_start,
+        ("0000/0000/0000", "ffff/ffff/ffff"),
+    )?;
+    terminal.wait_for_screen_text(
+        &format!("{REFRESH_PROBE_INPUT}{REFRESH_PROBE_INPUT}"),
+        FOCUS_INPUT_TIMEOUT,
+    )?;
+    terminal
+        .wait_for_composer_colors(vt100::Color::Rgb(0, 0, 0), vt100::Color::Rgb(244, 244, 244))?;
+    Ok(())
+}
+
 pub(super) struct PtyCodex {
     master: File,
     slave: File,
@@ -379,6 +453,9 @@ impl PtyCodex {
             .arg("-C")
             .arg(repo_root)
             .env("TERM", "xterm-256color")
+            .env("COLORTERM", "truecolor")
+            .env_remove("NO_COLOR")
+            .env_remove("FORCE_COLOR")
             // This PTY answers its own capability probes; it is not inside the caller's mux.
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
@@ -458,6 +535,85 @@ impl PtyCodex {
             FOCUS_INPUT_TIMEOUT,
             self.screen_contents(),
         );
+    }
+
+    fn answer_refresh_query_with_typeahead(
+        &mut self,
+        output_start: usize,
+        palette: (&str, &str),
+    ) -> Result<()> {
+        let deadline = Instant::now() + FOCUS_INPUT_TIMEOUT;
+        while Instant::now() < deadline {
+            self.read_output(Duration::from_millis(/*millis*/ 5))?;
+            let refresh_output = &self.output[output_start..];
+            if contains_bytes(refresh_output, b"\x1b]10;?")
+                && contains_bytes(refresh_output, b"\x1b]11;?")
+            {
+                let (foreground, background) = palette;
+                let input = format!(
+                    "\x1b[200~{REFRESH_PROBE_INPUT}\x1b[201~\x1b]10;rgb:{foreground}\x1b\\\
+                     \x1b]11;rgb:{background}\x1b\\\x1b[?1;2c"
+                );
+                self.write_input(input.as_bytes())?;
+                return Ok(());
+            }
+
+            if let Some(status) = self.child.try_wait()? {
+                bail!(
+                    "Codex exited before the refresh query ({status}); screen:\n{}",
+                    self.screen_contents(),
+                );
+            }
+        }
+
+        bail!(
+            "color-scheme event did not trigger an OSC 10/11 query within {:?}; screen:\n{}",
+            FOCUS_INPUT_TIMEOUT,
+            self.screen_contents(),
+        )
+    }
+
+    fn wait_for_screen_text(&mut self, text: &str, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            self.read_output(Duration::from_millis(/*millis*/ 20))?;
+            if self.screen_contains(text) {
+                return Ok(());
+            }
+            if let Some(status) = self.child.try_wait()? {
+                bail!(
+                    "Codex exited while waiting for {text:?} ({status}); screen:\n{}",
+                    self.screen_contents(),
+                );
+            }
+        }
+
+        bail!(
+            "screen did not contain {text:?} within {timeout:?}; screen:\n{}",
+            self.screen_contents(),
+        )
+    }
+
+    fn wait_for_composer_colors(
+        &mut self,
+        foreground: vt100::Color,
+        background: vt100::Color,
+    ) -> Result<()> {
+        let deadline = Instant::now() + FOCUS_INPUT_TIMEOUT;
+        while Instant::now() < deadline {
+            self.read_output(Duration::from_millis(20))?;
+            let screen = self.parser.screen();
+            let (row, column) = screen.cursor_position();
+            if let Some(cell) = screen.cell(row, column.saturating_sub(1))
+                && (cell.fgcolor(), cell.bgcolor()) == (foreground, background)
+            {
+                return Ok(());
+            }
+        }
+        bail!(
+            "composer did not update to {foreground:?} on {background:?}; screen:\n{}",
+            self.screen_contents()
+        )
     }
 
     fn answer_startup_queries(&mut self) -> Result<()> {

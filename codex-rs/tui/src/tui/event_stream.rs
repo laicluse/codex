@@ -35,6 +35,7 @@ use tokio_stream::wrappers::WatchStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use super::TuiEvent;
+use super::palette_refresh::PaletteRefresh;
 use super::size_monitor::SizeMonitor;
 
 /// Result type produced by an event source.
@@ -54,6 +55,8 @@ pub struct EventBroker<S: EventSource = CrosstermEventSource> {
     state: Mutex<EventBrokerState<S>>,
     resume_events_tx: watch::Sender<()>,
     pub(super) size_monitor: Option<SizeMonitor>,
+    terminal_palette_refresh_requested: AtomicBool,
+    terminal_palette_refresh: Mutex<PaletteRefresh>,
 }
 
 /// Tracks state of underlying [`EventSource`].
@@ -87,6 +90,8 @@ impl<S: EventSource + Default> EventBroker<S> {
             state: Mutex::new(EventBrokerState::Start),
             resume_events_tx,
             size_monitor: None,
+            terminal_palette_refresh_requested: AtomicBool::new(false),
+            terminal_palette_refresh: Mutex::new(PaletteRefresh::default()),
         }
     }
 
@@ -121,6 +126,27 @@ impl<S: EventSource + Default> EventBroker<S> {
     /// underlying crossterm stream to be recreated.
     pub fn resume_events_rx(&self) -> watch::Receiver<()> {
         self.resume_events_tx.subscribe()
+    }
+
+    pub(super) fn take_terminal_palette_refresh_request(&self) -> bool {
+        self.terminal_palette_refresh_requested
+            .swap(false, Ordering::Relaxed)
+    }
+
+    pub(super) fn begin_terminal_palette_refresh(&self) -> bool {
+        self.terminal_palette_refresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .begin()
+    }
+
+    pub(super) fn take_terminal_palette_update(
+        &self,
+    ) -> Option<crate::terminal_probe::DefaultColors> {
+        self.terminal_palette_refresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_completed()
     }
 }
 
@@ -313,6 +339,34 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                 Some(TuiEvent::FocusLost)
             }
             Event::Mouse(mouse) => Some(TuiEvent::Mouse(mouse)),
+            Event::ColorScheme(_) => {
+                self.broker
+                    .terminal_palette_refresh_requested
+                    .store(true, Ordering::Relaxed);
+                Some(TuiEvent::Draw)
+            }
+            Event::TerminalColor { slot, rgb } => {
+                self.broker
+                    .terminal_palette_refresh
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .receive(slot, rgb);
+                Some(TuiEvent::Draw)
+            }
+            Event::PrimaryDeviceAttributes => {
+                if self
+                    .broker
+                    .terminal_palette_refresh
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .finish()
+                {
+                    self.broker
+                        .terminal_palette_refresh_requested
+                        .store(true, Ordering::Relaxed);
+                }
+                Some(TuiEvent::Draw)
+            }
         }
     }
 }
@@ -526,6 +580,18 @@ mod tests {
             Some(TuiEvent::Key(key)) => assert_eq!(key, expected_key),
             other => panic!("expected queued key event, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn color_scheme_event_requests_palette_refresh_after_poll() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker.clone(), draw_rx, terminal_focused);
+
+        handle.send(Ok(Event::ColorScheme(crossterm::event::ColorScheme::Dark)));
+
+        assert!(matches!(stream.next().await, Some(TuiEvent::Draw)));
+        assert!(broker.take_terminal_palette_refresh_request());
+        assert!(!broker.take_terminal_palette_refresh_request());
     }
 
     #[tokio::test(flavor = "current_thread")]
